@@ -1,8 +1,10 @@
 from fastlri.base.symbol import Sym
 import numpy as np
 from collections import defaultdict as dd
+from fastlri.utils.chart_wrappers import CountedDD
 from fastlri.base.production import Production
-from fastlri.base.nonterminal import S
+# from fastlri.base.nonterminal import S
+from fastlri.utils.metrics import reset_all, IO, OPS, add, mul
 
 class Parser:
     def __init__(self, cfg):
@@ -35,11 +37,15 @@ class Parser:
                     for p, w in self.cfg.binary:
                         X, Y, Z = p.head, p.body[0], p.body[1]
                         β[i, X, k] += β[i, Y, j] * β[j, Z, k] * w
-        return β if chart else β[0, S, N]
+        return β if chart else β[0, self.cfg.S, N]
     
-    def cky_fast(self, input, chart=False):
+    def cky_fast(self, input, chart=False, return_metrics=False):
         """A faster version of CKY  for dense grammars. Requires CNF."""
         assert self.cfg.in_cnf
+
+        # select counted ops only when requested
+        _add = add if return_metrics else (lambda a, b: a + b)
+        _mul = mul if return_metrics else (lambda a, b: a * b)
 
         # convert input string to list
         if type(input) == str:
@@ -47,7 +53,8 @@ class Parser:
         N = len(input)
 
         # initialization
-        β = dd(lambda: 0.0)
+        # β = dd(lambda: 0.0)
+        β = (CountedDD if return_metrics else dd)(lambda: 0.0)
         β[0, self.cfg.S, 0] = self.cfg._P[self.cfg.S, ()]
 
         # create an index from NT triplets to binary production weights
@@ -60,7 +67,8 @@ class Parser:
         for (head, body), w in self.cfg.terminal:
             for k in range(N):
                 if body[0] == input[k]:
-                    β[k, head, k+1] += w
+                    # β[k, head, k+1] += w
+                    β[k, head, k+1] = _add(β[k, head, k+1], w)
 
         # binary productions
         for l in range(2, N+1):
@@ -70,10 +78,12 @@ class Parser:
                     for Z in self.cfg.V:
                         γ = 0.0
                         for j in range(i+1, k):
-                            γ += β[i, Y, j] * β[j, Z, k]
+                            # γ += β[i, Y, j] * β[j, Z, k]
+                            γ = _add(γ, _mul(β[i, Y, j], β[j, Z, k]))
                         for X in self.cfg.V:
-                            β[i, X, k] += γ * W[X, Y, Z]
-        return β if chart else β[0, S, N]
+                            # β[i, X, k] += γ * W[X, Y, Z]
+                            β[i, X, k] = _add(β[i, X, k], _mul(γ, W[X, Y, Z]))
+        return β if chart else β[0, self.cfg.S, N]
 
     def plc(self):
         """Computes the left-corner expectations. Requires CNF."""
@@ -146,11 +156,17 @@ class Parser:
                                 ppre[i, X, k] += E2[X, Y, Z] * β[i, Y, j] \
                                     * ppre[j, Z, k]
         
-        return ppre if chart else ppre[0, S, N]
+        return ppre if chart else ppre[0, self.cfg.S, N]
     
-    def lri_fast(self, input, chart=False):
+    def lri_fast(self, input, chart=False, return_metrics=False):
         """Faster prefix parsing algorithm by Nowak and Cotterell (2023). Requires CNF."""
         assert self.cfg.in_cnf
+        if return_metrics:
+            reset_all()
+
+        # choose ops
+        _add = add if return_metrics else (lambda a, b: a + b)
+        _mul = mul if return_metrics else (lambda a, b: a * b)
         
         # convert input string to list
         if type(input) == str:
@@ -160,33 +176,39 @@ class Parser:
         N = len(input)
         V = self.cfg.ordered_V
         V_idx = {X:i for i,X in enumerate(V)}
-        ppre = dd(lambda: 0.0)
+        # ppre = dd(lambda: 0.0)
+        ppre = (CountedDD if return_metrics else dd)(lambda: 0.0)
         for k in range(N+1):
             for X in self.cfg.V:
                 ppre[k, X, k] = 1
 
         # precompute β using CKY
-        β = self.cky_fast(input, chart=True)
+        β = self.cky_fast(input, chart=True, return_metrics=return_metrics)
 
         # precompute E
-        E = dd(lambda: 0.0)
+        # E = dd(lambda: 0.0)
+        E = (CountedDD if return_metrics else dd)(lambda: 0.0)
         P_L = self.plc()
         for X in self.cfg.V:
             for Y in self.cfg.V:
                 E[X, Y] = P_L[V_idx[X], V_idx[Y]]
 
         # precompute γ and δ
-        γ = dd(lambda: 0.0)
-        δ = dd(lambda: 0.0)
+        # γ = dd(lambda: 0.0)
+        γ = (CountedDD if return_metrics else dd)(lambda: 0.0)
+        # δ = dd(lambda: 0.0)
+        δ = (CountedDD if return_metrics else dd)(lambda: 0.0)
         for i in range(N):
             for j in range(N):
                 for p, w in self.cfg.binary:
                     X, Y, Z = p.head, p.body[0], p.body[1]
-                    γ[i, j, X, Z] += w * β[i, Y, j]
+                    # γ[i, j, X, Z] += w * β[i, Y, j]
+                    γ[i, j, X, Z] = _add(γ[i, j, X, Z], _mul(w, β[i, Y, j]))
                 for X in self.cfg.V:
                     for Y in self.cfg.V:
                         for Z in self.cfg.V:
-                            δ[i, j, X, Z] += E[X, Y] * γ[i, j, Y, Z]
+                            # δ[i, j, X, Z] += E[X, Y] * γ[i, j, Y, Z]
+                            δ[i, j, X, Z] = _add(δ[i, j, X, Z], _mul(E[X, Y], γ[i, j, Y, Z]))
 
         # compute base case
         for X in self.cfg.V:
@@ -194,7 +216,8 @@ class Parser:
                 for p, w in self.cfg.terminal:
                     Y, v = p.head, p.body[0]
                     if v == input[i]:
-                        ppre[i, X, i+1] += E[X, Y] * w
+                        # ppre[i, X, i+1] += E[X, Y] * w
+                        ppre[i, X, i+1] = _add(ppre[i, X, i+1], _mul(E[X, Y], w))
 
         # compute prefix probability
         for l in range(2, N+1):
@@ -203,6 +226,11 @@ class Parser:
                 for j in range(i+1, k):
                     for X in self.cfg.V:
                         for Z in self.cfg.V:
-                            ppre[i, X, k] += δ[i, j, X, Z] * ppre[j, Z, k]
-        
-        return ppre if chart else ppre[0, S, N]
+                            # ppre[i, X, k] += δ[i, j, X, Z] * ppre[j, Z, k]
+                            ppre[i, X, k] = _add(ppre[i, X, k], _mul(δ[i, j, X, Z], ppre[j, Z, k]))
+        result = ppre if chart else ppre[0, self.cfg.S, N]
+        if return_metrics:
+            return result, {"IO": dict(IO), "OPS": dict(OPS)}
+        return result
+
+
