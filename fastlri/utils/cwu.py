@@ -11,11 +11,15 @@ DEFAULT_WEIGHTS = {
     "chart_write_new": 10.0, "chart_write_over": 8.0,
     # reserved (not used yet, but won’t hurt if present)
     "chart_rmw": 12.0,
-    # you can add agenda/set/hash keys later if you instrument them
 }
 
 def cwu(metrics: dict, weights: dict | None = None) -> float:
-    """Collapse metrics into a single scalar 'Computation Work Units' (CWU)."""
+    """
+    Collapse metrics into a single scalar 'Computation Work Units' (CWU).
+
+    metrics: a dict like {"IO": {...}, "OPS": {...}}. This is exactly what
+             Metrics.snapshot() returns. (So just pass inc.metrics.snapshot().)
+    """
     w = weights or DEFAULT_WEIGHTS
     IO = metrics.get("IO", {})
     OPS = metrics.get("OPS", {})

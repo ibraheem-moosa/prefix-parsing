@@ -1,12 +1,19 @@
+# fastlri/parsing/incremental.py
+
 from collections import defaultdict as dd
 from fastlri.base.symbol import Sym
-from fastlri.utils.metrics import reset_all, IO, OPS, add, mul
-from fastlri.utils.chart_wrappers import CountedDD
+from fastlri.utils.metrics import Metrics
+from fastlri.utils.chart_wrappers import make_counted_dd
 
 class IncrementalLRI:
     """
     Incremental prefix parser for lri_fast that reuses DP state across appends.
-    Requires CNF. Preserves metrics when return_metrics=True.
+    Requires CNF.
+
+    Metrics:
+      - When return_metrics=True, arithmetic and chart I/O are counted via a per-instance
+        Metrics object exposed at self.metrics. Use self.metrics.snapshot() to obtain
+        {"IO":..., "OPS":...} after append().
 
     Approximation knobs (both OFF by default for exact mode):
       - max_window:    if set (int > 0), only consider split points j in [k-max_window, k-1]
@@ -14,18 +21,26 @@ class IncrementalLRI:
 
     Key exact speedup retained: γ & δ are updated only for the *new* split j = N-1 at each append.
     """
+
     def __init__(self, cfg, return_metrics=False, max_window=None, max_backspan=None):
         assert cfg.in_cnf
         self.cfg = cfg
-        self.return_metrics = return_metrics
+        self.return_metrics = bool(return_metrics)
+
+        # Per-instance metrics
+        self.metrics = Metrics(enabled=self.return_metrics)
 
         # Approximation controls
         self.max_window = max_window if (isinstance(max_window, int) and max_window > 0) else None
         self.max_backspan = max_backspan if (isinstance(max_backspan, int) and max_backspan > 0) else None
 
         # arithmetic ops (instrumented when return_metrics=True)
-        self._add = add if return_metrics else (lambda a, b: a + b)
-        self._mul = mul if return_metrics else (lambda a, b: a * b)
+        if self.return_metrics:
+            self._add = self.metrics.add
+            self._mul = self.metrics.mul
+        else:
+            self._add = (lambda a, b: a + b)
+            self._mul = (lambda a, b: a * b)
 
         # ---- static (precomputed once) ----
         self.V = cfg.ordered_V
@@ -52,8 +67,13 @@ class IncrementalLRI:
         self.tokens = []  # list[Sym]
         self.N = 0
 
-        # Use CountedDD when instrumenting IO
-        DD = CountedDD if self.return_metrics else dd
+        # Choose chart type; when instrumenting, tie to this instance's metrics
+        if self.return_metrics:
+            DD = make_counted_dd(self.metrics)
+        else:
+            DD = dd
+        self._DD_factory = DD  # keep so score_with_candidate can restore same class
+
         self.beta  = DD(lambda: 0.0)  # CKY chart β[i, X, k]
         self.ppre  = DD(lambda: 0.0)  # prefix chart ppre[i, X, k]
         self.gamma = DD(lambda: 0.0)  # γ[i, j, X, Z]   (no dependence on k)
@@ -118,7 +138,14 @@ class IncrementalLRI:
         Append one terminal symbol and update β and ppre for k=N.
         γ/δ are updated *only* for the new split j=N-1 (incremental).
         If max_window/max_backspan are set, approximate by restricting j and/or i0.
+
+        After this returns, if return_metrics=True you can read per-append counters via:
+            m = self.metrics.snapshot()
         """
+        # per-append metrics isolation
+        if self.return_metrics:
+            self.metrics.reset()
+
         # convert token
         tok = Sym(token_str) if not isinstance(token_str, Sym) else token_str
 
@@ -126,9 +153,6 @@ class IncrementalLRI:
         self.tokens.append(tok)
         self.N += 1
         N = self.N
-
-        if self.return_metrics:
-            reset_all()
 
         self._ensure_empty_diagonal(N)  # ensure ppre[i,X,i]=1 up to new N
 
@@ -224,8 +248,8 @@ class IncrementalLRI:
         self.append(cand_token_str)
         val = self.score_prefix()
 
-        # restore with the same chart type (CountedDD when instrumenting)
-        DD = CountedDD if self.return_metrics else dd
+        # restore with the same chart type tied to this.metrics
+        DD = self._DD_factory
         self.beta  = DD(lambda: 0.0); self.beta.update(snap_beta)
         self.ppre  = DD(lambda: 0.0); self.ppre.update(snap_ppre)
         self.gamma = DD(lambda: 0.0); self.gamma.update(snap_gamma)
