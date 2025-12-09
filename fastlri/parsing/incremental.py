@@ -6,35 +6,14 @@ from fastlri.utils.metrics import Metrics
 from fastlri.utils.chart_wrappers import make_counted_dd
 
 class IncrementalLRI:
-    """
-    Incremental prefix parser for lri_fast that reuses DP state across appends.
-    Requires CNF.
-
-    Metrics:
-      - When return_metrics=True, arithmetic and chart I/O are counted via a per-instance
-        Metrics object exposed at self.metrics. Use self.metrics.snapshot() to obtain
-        {"IO":..., "OPS":...} after append().
-
-    Approximation knobs (both OFF by default for exact mode):
-      - max_window:    if set (int > 0), only consider split points j in [k-max_window, k-1]
-      - max_backspan:  if set (int > 0), only build spans that start no earlier than i0 >= k-max_backspan
-
-    Key exact speedup retained: γ & δ are updated only for the *new* split j = N-1 at each append.
-    """
-
     def __init__(self, cfg, return_metrics=False, max_window=None, max_backspan=None):
         assert cfg.in_cnf
         self.cfg = cfg
         self.return_metrics = bool(return_metrics)
-
-        # Per-instance metrics
         self.metrics = Metrics(enabled=self.return_metrics)
-
-        # Approximation controls
         self.max_window = max_window if (isinstance(max_window, int) and max_window > 0) else None
         self.max_backspan = max_backspan if (isinstance(max_backspan, int) and max_backspan > 0) else None
 
-        # arithmetic ops (instrumented when return_metrics=True)
         if self.return_metrics:
             self._add = self.metrics.add
             self._mul = self.metrics.mul
@@ -42,51 +21,36 @@ class IncrementalLRI:
             self._add = (lambda a, b: a + b)
             self._mul = (lambda a, b: a * b)
 
-        # ---- static (precomputed once) ----
         self.V = cfg.ordered_V
         self.V_idx = {X: i for i, X in enumerate(self.V)}
 
-        # Sparse fanout indices from grammar rules
-        self._xz_from_yz = {}  # (Y,Z) -> [(X,w)]
-        self._xz_from_y  = {}  # Y -> [(X,Z,w)]
+        self._xz_from_yz = {}
+        self._xz_from_y  = {}
         for p, w in cfg.binary:
             X, Y, Z = p.head, p.body[0], p.body[1]
             self._xz_from_yz.setdefault((Y, Z), []).append((X, w))
             self._xz_from_y.setdefault(Y, []).append((X, Z, w))
 
-        # Left-corner closure
         self.P_L = self._plc()
-
-        # E[X,Y] as dict
         self.E = dd(lambda: 0.0)
         for X in self.cfg.V:
             for Y in self.cfg.V:
                 self.E[X, Y] = self.P_L[self.V_idx[X], self.V_idx[Y]]
 
-        # ---- dynamic DP state (grows with tokens) ----
-        self.tokens = []  # list[Sym]
+        self.tokens = []
         self.N = 0
-
-        # Choose chart type; when instrumenting, tie to this instance's metrics
         if self.return_metrics:
             DD = make_counted_dd(self.metrics)
         else:
             DD = dd
-        self._DD_factory = DD  # keep so score_with_candidate can restore same class
-
-        self.beta  = DD(lambda: 0.0)  # CKY chart β[i, X, k]
-        self.ppre  = DD(lambda: 0.0)  # prefix chart ppre[i, X, k]
-        self.gamma = DD(lambda: 0.0)  # γ[i, j, X, Z]   (no dependence on k)
-        self.delta = DD(lambda: 0.0)  # δ[i, j, X, Z]   (no dependence on k)
-
-        # ppre[i,X,i] = 1 is ensured lazily via _ensure_empty_diagonal
+        self._DD_factory = DD
+        self.beta  = DD(lambda: 0.0)
+        self.ppre  = DD(lambda: 0.0)
+        self.gamma = DD(lambda: 0.0)
+        self.delta = DD(lambda: 0.0)
+        self.last_ambiguity = {}  # <-- NEW
 
     def _plc(self):
-        """
-        Compute left-corner expectations P_L = (I - P)^(-1) using NumPy.
-        In light/pyPy runs you can monkeypatch this method to return a wrapper
-        around a cached matrix (your light script does this).
-        """
         import numpy as np
         V_idx = self.V_idx
         P = np.zeros((len(self.V), len(self.V)))
@@ -96,25 +60,16 @@ class IncrementalLRI:
         return np.linalg.inv(np.eye(len(self.V)) - P)
 
     def _ensure_empty_diagonal(self, upto):
-        # Ensure ppre[i,X,i] = 1 for i up to 'upto'
         for i in range(upto + 1):
             for X in self.cfg.V:
-                if (i, X, i) not in self.ppre:  # avoid double-counting IO
+                if (i, X, i) not in self.ppre:
                     self.ppre[i, X, i] = 1.0
 
-    # ---------- incremental γ/δ slice update for a fixed j ----------
     def _update_gamma_delta_for_j(self, j):
-        """
-        Build γ[i0, j, *, *] and δ[i0, j, *, *] for required i0.
-        If max_backspan is set, restrict to i0 >= j - max_backspan + 1.
-        """
         i0_min = 0
         if self.max_backspan is not None:
-            # i0 must satisfy (j - i0) < max_backspan  =>  i0 > j - max_backspan
             i0_min = max(0, j - self.max_backspan + 1)
-
         for i0 in range(i0_min, j):
-            # γ[i0, j, X, Z] = sum_Y w(X→Y Z) * β[i0, Y, j]
             for Y in self.cfg.V:
                 b = self.beta[i0, Y, j]
                 if b == 0.0:
@@ -122,7 +77,6 @@ class IncrementalLRI:
                 for X, Z, w in self._xz_from_y.get(Y, ()):
                     self.gamma[i0, j, X, Z] = self._add(self.gamma[i0, j, X, Z],
                                                          self._mul(w, b))
-            # δ[i0, j, X, Z] = sum_Y E[X,Y] * γ[i0, j, Y, Z]
             for X in self.cfg.V:
                 for Z in self.cfg.V:
                     acc = 0.0
@@ -134,46 +88,34 @@ class IncrementalLRI:
                         self.delta[i0, j, X, Z] = self._add(self.delta[i0, j, X, Z], acc)
 
     def append(self, token_str):
-        """
-        Append one terminal symbol and update β and ppre for k=N.
-        γ/δ are updated *only* for the new split j=N-1 (incremental).
-        If max_window/max_backspan are set, approximate by restricting j and/or i0.
-
-        After this returns, if return_metrics=True you can read per-append counters via:
-            m = self.metrics.snapshot()
-        """
-        # per-append metrics isolation
         if self.return_metrics:
             self.metrics.reset()
 
-        # convert token
         tok = Sym(token_str) if not isinstance(token_str, Sym) else token_str
-
-        # extend length
         self.tokens.append(tok)
         self.N += 1
         N = self.N
+        self._ensure_empty_diagonal(N)
 
-        self._ensure_empty_diagonal(N)  # ensure ppre[i,X,i]=1 up to new N
+        # Track which (i,X,k) get written this append
+        written_cells = set()
+        yz_pairs = set()
 
-        # (1) Terminal initialization: β[N-1, head, N]
+        # (1) Terminal initialization
         for (head, body), w in self.cfg.terminal:
             if body[0] == tok:
                 self.beta[N - 1, head, N] = self._add(self.beta[N - 1, head, N], w)
+                written_cells.add((N - 1, head, N))
 
-        # (2) CKY binary updates for spans that end at k = N
-        #     Apply max_backspan (cap span length) and max_window (cap j range).
+        # (2) CKY binary updates
         for span_len in range(2, N + 1):
             if self.max_backspan is not None and span_len > self.max_backspan:
-                continue  # skip very long backspans
+                continue
             i0 = N - span_len
             k = N
-
-            # j range
             j_start = i0 + 1
             if self.max_window is not None:
                 j_start = max(j_start, k - self.max_window)
-
             for Y in self.cfg.V:
                 for Z in self.cfg.V:
                     gamma_tmp = 0.0
@@ -185,18 +127,20 @@ class IncrementalLRI:
                         if b2 == 0.0:
                             continue
                         gamma_tmp = self._add(gamma_tmp, self._mul(b1, b2))
+                        yz_pairs.add((Y, Z))
                     if gamma_tmp == 0.0:
                         continue
                     for X, w in self._xz_from_yz.get((Y, Z), ()):
                         self.beta[i0, X, k] = self._add(self.beta[i0, X, k],
                                                          self._mul(gamma_tmp, w))
+                        written_cells.add((i0, X, k))
 
-        # (3) INCREMENTAL γ/δ update: only for the new split j = N-1 (if it's in window)
+        # (3) Incremental γ/δ update
         if N - 1 >= 1:
             if (self.max_window is None) or (N - 1 >= N - self.max_window):
                 self._update_gamma_delta_for_j(N - 1)
 
-        # (4) Prefix base case for the new 1-length span at end
+        # (4) Prefix base case
         for X in self.cfg.V:
             for (p, w) in self.cfg.terminal:
                 Y, v = p.head, p.body[0]
@@ -204,18 +148,15 @@ class IncrementalLRI:
                     self.ppre[N - 1, X, N] = self._add(self.ppre[N - 1, X, N],
                                                        self._mul(self.E[X, Y], w))
 
-        # (5) Prefix recurrence only for k = N.
-        #     Reuse δ[i0, j, X, Z] for j in restricted range; respect max_backspan and max_window.
+        # (5) Prefix recurrence
         for span_len in range(2, N + 1):
             if self.max_backspan is not None and span_len > self.max_backspan:
                 continue
             i0 = N - span_len
             k = N
-
             j_start = i0 + 1
             if self.max_window is not None:
                 j_start = max(j_start, k - self.max_window)
-
             for j in range(j_start, k):
                 for X in self.cfg.V:
                     for Z in self.cfg.V:
@@ -227,34 +168,37 @@ class IncrementalLRI:
                             continue
                         self.ppre[i0, X, k] = self._add(self.ppre[i0, X, k],
                                                         self._mul(d, rhs))
-        # done
+
+        # ---- Ambiguity proxies (computed after all updates) ----
+        active_beta_end = sum(1 for (i,X,k) in self.beta if k == N and self.beta[i,X,k] != 0)
+        active_gamma_newslice = sum(1 for (i,j,X,Z) in self.gamma if j == N - 1 and self.gamma[i,j,X,Z] != 0)
+        active_delta_newslice = sum(1 for (i,j,X,Z) in self.delta if j == N - 1 and self.delta[i,j,X,Z] != 0)
+        active_write_targets = len(written_cells)
+        active_YZ_pairs = len(yz_pairs)
+
+        self.last_ambiguity = {
+            "active_beta_end": active_beta_end,
+            "active_gamma_newslice": active_gamma_newslice,
+            "active_delta_newslice": active_delta_newslice,
+            "active_write_targets": active_write_targets,
+            "active_YZ_pairs": active_YZ_pairs,
+        }
 
     def score_prefix(self):
-        """Probability of the current prefix."""
         return self.ppre[0, self.cfg.S, self.N]
 
     def score_with_candidate(self, cand_token_str):
-        """
-        Try a candidate terminal WITHOUT committing permanent state.
-        Snapshots DP charts, calls append(), reads score, then restores.
-        """
-        # snapshot current dicts (values only)
         snap_beta  = dict(self.beta)
         snap_ppre  = dict(self.ppre)
         snap_gamma = dict(self.gamma)
         snap_delta = dict(self.delta)
-
-        # do the append
         self.append(cand_token_str)
         val = self.score_prefix()
-
-        # restore with the same chart type tied to this.metrics
         DD = self._DD_factory
         self.beta  = DD(lambda: 0.0); self.beta.update(snap_beta)
         self.ppre  = DD(lambda: 0.0); self.ppre.update(snap_ppre)
         self.gamma = DD(lambda: 0.0); self.gamma.update(snap_gamma)
         self.delta = DD(lambda: 0.0); self.delta.update(snap_delta)
-
         self.tokens.pop()
         self.N -= 1
         return val
